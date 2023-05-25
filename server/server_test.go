@@ -8,8 +8,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"testing"
@@ -21,7 +21,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	google_protobuf "github.com/golang/protobuf/ptypes/empty"
+	protobuf "github.com/golang/protobuf/ptypes/empty"
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
@@ -33,27 +33,27 @@ import (
 
 type FakeServer struct{}
 
-func (f FakeServer) FailWithError(ctx context.Context, req *google_protobuf.Empty) (*google_protobuf.Empty, error) {
+func (f FakeServer) FailWithError(_ context.Context, _ *protobuf.Empty) (*protobuf.Empty, error) {
 	return nil, errors.New("test error")
 }
 
-func (f FakeServer) FailWithHTTPError(ctx context.Context, req *FailWithHTTPErrorRequest) (*google_protobuf.Empty, error) {
+func (f FakeServer) FailWithHTTPError(_ context.Context, req *FailWithHTTPErrorRequest) (*protobuf.Empty, error) {
 	return nil, httpgrpc.Errorf(int(req.Code), strconv.Itoa(int(req.Code)))
 }
 
-func (f FakeServer) Succeed(ctx context.Context, req *google_protobuf.Empty) (*google_protobuf.Empty, error) {
-	return &google_protobuf.Empty{}, nil
+func (f FakeServer) Succeed(_ context.Context, _ *protobuf.Empty) (*protobuf.Empty, error) {
+	return &protobuf.Empty{}, nil
 }
 
-func (f FakeServer) Sleep(ctx context.Context, req *google_protobuf.Empty) (*google_protobuf.Empty, error) {
+func (f FakeServer) Sleep(ctx context.Context, _ *protobuf.Empty) (*protobuf.Empty, error) {
 	err := cancelableSleep(ctx, 10*time.Second)
-	return &google_protobuf.Empty{}, err
+	return &protobuf.Empty{}, err
 }
 
-func (f FakeServer) StreamSleep(req *google_protobuf.Empty, stream FakeServer_StreamSleepServer) error {
+func (f FakeServer) StreamSleep(_ *protobuf.Empty, stream FakeServer_StreamSleepServer) error {
 	for x := 0; x < 100; x++ {
 		time.Sleep(time.Second / 100.0)
-		if err := stream.Send(&google_protobuf.Empty{}); err != nil {
+		if err := stream.Send(&protobuf.Empty{}); err != nil {
 			return err
 		}
 	}
@@ -91,7 +91,7 @@ func TestTCPv4Network(t *testing.T) {
 		require.NotNil(t, <-errChan)
 
 		// So that address is freed for further tests.
-		srv.GRPC.Stop()
+		srv.Shutdown()
 	})
 
 	t.Run("grpc", func(t *testing.T) {
@@ -106,6 +106,9 @@ func TestTCPv4Network(t *testing.T) {
 
 		require.NoError(t, srv.grpcListener.Close())
 		require.NotNil(t, <-errChan)
+
+		// So that address is freed for further tests.
+		srv.Shutdown()
 	})
 }
 
@@ -127,14 +130,14 @@ func TestDefaultAddresses(t *testing.T) {
 		w.WriteHeader(204)
 	})
 
-	go server.Run()
+	go func() { require.NoError(t, server.Run()) }()
 	defer server.Shutdown()
 
 	conn, err := grpc.Dial("localhost:9095", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
-	defer conn.Close()
+	defer func() { require.NoError(t, conn.Close()) }()
 
-	empty := google_protobuf.Empty{}
+	empty := protobuf.Empty{}
 	client := NewFakeServerClient(conn)
 	_, err = client.Succeed(context.Background(), &empty)
 	require.NoError(t, err)
@@ -146,11 +149,16 @@ func TestDefaultAddresses(t *testing.T) {
 }
 
 func TestErrorInstrumentationMiddleware(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	prometheus.DefaultRegisterer = reg
+	prometheus.DefaultGatherer = reg
+
 	var cfg Config
 	cfg.RegisterFlags(flag.NewFlagSet("", flag.ExitOnError))
 	cfg.HTTPListenPort = 9090 // can't use 80 as ordinary user
 	cfg.GRPCListenAddress = "localhost"
 	cfg.GRPCListenPort = 1234
+	cfg.Registerer = reg
 	server, err := New(cfg)
 	require.NoError(t, err)
 
@@ -169,13 +177,13 @@ func TestErrorInstrumentationMiddleware(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	})
 
-	go server.Run()
+	go func() { require.NoError(t, server.Run()) }()
 
 	conn, err := grpc.Dial("localhost:1234", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
-	empty := google_protobuf.Empty{}
+	empty := protobuf.Empty{}
 	client := NewFakeServerClient(conn)
 	res, err := client.Succeed(context.Background(), &empty)
 	require.NoError(t, err)
@@ -248,7 +256,7 @@ func TestErrorInstrumentationMiddleware(t *testing.T) {
 		require.Error(t, err, context.Canceled)
 	}
 
-	conn.Close()
+	require.NoError(t, conn.Close())
 	server.Shutdown()
 
 	metrics, err := prometheus.DefaultGatherer.Gather()
@@ -306,11 +314,11 @@ func TestHTTPInstrumentationMetrics(t *testing.T) {
 		w.WriteHeader(500)
 	})
 	server.HTTP.HandleFunc("/sleep10", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(ioutil.Discard, r.Body) // Consume body, otherwise it's not counted.
+		_, _ = io.Copy(io.Discard, r.Body) // Consume body, otherwise it's not counted.
 		_ = cancelableSleep(r.Context(), time.Second*10)
 	})
 
-	go server.Run()
+	go func() { require.NoError(t, server.Run()) }()
 
 	callThenCancel := func(f func(ctx context.Context) error) error {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -596,7 +604,7 @@ func TestRunReturnsError(t *testing.T) {
 // Test to see what the logging of a 500 error looks like
 func TestMiddlewareLogging(t *testing.T) {
 	var level logging.Level
-	level.Set("info")
+	require.NoError(t, level.Set("info"))
 	cfg := Config{
 		HTTPListenNetwork:             DefaultNetwork,
 		HTTPListenAddress:             "localhost",
@@ -616,7 +624,7 @@ func TestMiddlewareLogging(t *testing.T) {
 		w.WriteHeader(500)
 	})
 
-	go server.Run()
+	go func() { require.NoError(t, server.Run()) }()
 	defer server.Shutdown()
 
 	req, err := http.NewRequest("GET", "http://127.0.0.1:9192/error500", nil)
@@ -627,7 +635,7 @@ func TestMiddlewareLogging(t *testing.T) {
 
 func TestTLSServer(t *testing.T) {
 	var level logging.Level
-	level.Set("info")
+	require.NoError(t, level.Set("info"))
 
 	cmd := exec.Command("bash", "certs/genCerts.sh", "certs", "1")
 	err := cmd.Run()
@@ -658,19 +666,20 @@ func TestTLSServer(t *testing.T) {
 	require.NoError(t, err)
 
 	server.HTTP.HandleFunc("/testhttps", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Hello World!"))
+		_, err := w.Write([]byte("Hello World!"))
+		require.NoError(t, err)
 	})
 
 	fakeServer := FakeServer{}
 	RegisterFakeServerServer(server.GRPC, fakeServer)
 
-	go server.Run()
+	go func() { require.NoError(t, server.Run()) }()
 	defer server.Shutdown()
 
 	clientCert, err := tls.LoadX509KeyPair("certs/client.crt", "certs/client.key")
 	require.NoError(t, err)
 
-	caCert, err := ioutil.ReadFile(cfg.HTTPTLSConfig.ClientCAs)
+	caCert, err := os.ReadFile(cfg.HTTPTLSConfig.ClientCAs)
 	require.NoError(t, err)
 
 	caCertPool := x509.NewCertPool()
@@ -688,7 +697,7 @@ func TestTLSServer(t *testing.T) {
 	client := &http.Client{Transport: tr}
 	res, err := client.Get("https://localhost:9193/testhttps")
 	require.NoError(t, err)
-	defer res.Body.Close()
+	defer func() { require.NoError(t, res.Body.Close()) }()
 
 	require.Equal(t, res.StatusCode, http.StatusOK)
 
@@ -699,9 +708,9 @@ func TestTLSServer(t *testing.T) {
 
 	conn, err := grpc.Dial("localhost:9194", grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 	require.NoError(t, err)
-	defer conn.Close()
+	defer require.NoError(t, res.Body.Close())
 
-	empty := google_protobuf.Empty{}
+	empty := protobuf.Empty{}
 	grpcClient := NewFakeServerClient(conn)
 	grpcRes, err := grpcClient.Succeed(context.Background(), &empty)
 	require.NoError(t, err)
@@ -712,17 +721,17 @@ type FakeLogger struct {
 	sourceIPs string
 }
 
-func (f *FakeLogger) Debugf(format string, args ...interface{}) {}
-func (f *FakeLogger) Debugln(args ...interface{})               {}
+func (f *FakeLogger) Debugf(_ string, _ ...interface{}) {}
+func (f *FakeLogger) Debugln(_ ...interface{})          {}
 
-func (f *FakeLogger) Infof(format string, args ...interface{}) {}
-func (f *FakeLogger) Infoln(args ...interface{})               {}
+func (f *FakeLogger) Infof(_ string, _ ...interface{}) {}
+func (f *FakeLogger) Infoln(_ ...interface{})          {}
 
-func (f *FakeLogger) Errorf(format string, args ...interface{}) {}
-func (f *FakeLogger) Errorln(args ...interface{})               {}
+func (f *FakeLogger) Errorf(_ string, _ ...interface{}) {}
+func (f *FakeLogger) Errorln(_ ...interface{})          {}
 
-func (f *FakeLogger) Warnf(format string, args ...interface{}) {}
-func (f *FakeLogger) Warnln(args ...interface{})               {}
+func (f *FakeLogger) Warnf(_ string, _ ...interface{}) {}
+func (f *FakeLogger) Warnln(_ ...interface{})          {}
 
 func (f *FakeLogger) WithField(key string, value interface{}) logging.Interface {
 	if key == "sourceIPs" {
@@ -732,13 +741,13 @@ func (f *FakeLogger) WithField(key string, value interface{}) logging.Interface 
 	return f
 }
 
-func (f *FakeLogger) WithFields(fields logging.Fields) logging.Interface {
+func (f *FakeLogger) WithFields(_ logging.Fields) logging.Interface {
 	return f
 }
 
 func TestLogSourceIPs(t *testing.T) {
 	var level logging.Level
-	level.Set("debug")
+	require.NoError(t, level.Set("debug"))
 	fake := FakeLogger{}
 	cfg := Config{
 		HTTPListenNetwork: DefaultNetwork,
@@ -759,7 +768,7 @@ func TestLogSourceIPs(t *testing.T) {
 		w.WriteHeader(500)
 	})
 
-	go server.Run()
+	go func() { require.NoError(t, server.Run()) }()
 	defer server.Shutdown()
 
 	require.Empty(t, fake.sourceIPs)
