@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -291,8 +292,10 @@ func TestHTTPInstrumentationMetrics(t *testing.T) {
 	var cfg Config
 	cfg.RegisterFlags(flag.NewFlagSet("", flag.ExitOnError))
 	cfg.HTTPListenPort = 9090 // can't use 80 as ordinary user
+	cfg.HTTPConnLimit = 10
 	cfg.GRPCListenAddress = "localhost"
 	cfg.GRPCListenPort = 1234
+	cfg.GRPCConnLimit = 11
 	server, err := New(cfg)
 	require.NoError(t, err)
 
@@ -326,7 +329,7 @@ func TestHTTPInstrumentationMetrics(t *testing.T) {
 		require.NoError(t, err)
 		resp, err := http.DefaultClient.Do(req)
 		require.NoError(t, err)
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Equal(t, "OK", string(body))
 	}
@@ -348,7 +351,9 @@ func TestHTTPInstrumentationMetrics(t *testing.T) {
 
 	server.Shutdown()
 
-	require.NoError(t, testutil.GatherAndCompare(prometheus.DefaultGatherer, bytes.NewBufferString(`
+	require.NoError(t, testutil.GatherAndCompare(
+		prometheus.DefaultGatherer,
+		bytes.NewBufferString(`
 		# HELP inflight_requests Current number of inflight requests.
 		# TYPE inflight_requests gauge
 		inflight_requests{method="POST",route="sleep10"} 0
@@ -435,7 +440,116 @@ func TestHTTPInstrumentationMetrics(t *testing.T) {
 		# TYPE tcp_connections gauge
 		tcp_connections{protocol="http"} 0
 		tcp_connections{protocol="grpc"} 0
-	`), "request_message_bytes", "response_message_bytes", "inflight_requests", "tcp_connections"))
+		
+		# HELP tcp_connections_limit The max number of TCP connections that can be accepted (0 means no limit).
+		# TYPE tcp_connections_limit gauge
+		tcp_connections_limit{protocol="grpc"} 11
+		tcp_connections_limit{protocol="http"} 10
+		`),
+		"request_message_bytes",
+		"response_message_bytes",
+		"inflight_requests",
+		"tcp_connections",
+		"tcp_connections_limit",
+		"inflight_requests",
+	))
+}
+
+func TestReusingExistingMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	cfg := Config{
+		HTTPListenAddress:             "localhost",
+		HTTPListenPort:                9090,
+		GRPCListenPort:                9091,
+		GRPCListenAddress:             "localhost",
+		ServerGracefulShutdownTimeout: 5 * time.Second,
+		Registerer:                    reg,
+	}
+
+	httpHandler := func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("OK"))
+	}
+
+	server, err := NewReusingMetrics(cfg)
+	require.NoError(t, err)
+	server.HTTP.HandleFunc("/succeed", httpHandler)
+	go func() { require.NoError(t, server.Run()) }()
+
+	makeRequest := func() {
+		url := fmt.Sprintf("http://127.0.0.1:%d/succeed", cfg.HTTPListenPort)
+		req, err := http.NewRequest("GET", url, nil)
+		require.NoError(t, err)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Equal(t, "OK", string(body))
+	}
+
+	makeRequest()
+	server.Shutdown()
+
+	// should not panic and reuse existing metrics
+	server, err = NewReusingMetrics(cfg)
+	require.NoError(t, err)
+	server.HTTP.HandleFunc("/succeed", httpHandler)
+	go func() { require.NoError(t, server.Run()) }()
+
+	makeRequest()
+	server.Shutdown()
+
+	require.NoError(t, testutil.GatherAndCompare(
+		reg,
+		bytes.NewBufferString(`
+		# HELP inflight_requests Current number of inflight requests.
+		# TYPE inflight_requests gauge
+		inflight_requests{method="GET",route="succeed"} 0
+
+		# HELP request_message_bytes Size (in bytes) of messages received in the request.
+		# TYPE request_message_bytes histogram
+		request_message_bytes_bucket{method="GET",route="succeed",le="1.048576e+06"} 2
+		request_message_bytes_bucket{method="GET",route="succeed",le="2.62144e+06"} 2
+		request_message_bytes_bucket{method="GET",route="succeed",le="5.24288e+06"} 2
+		request_message_bytes_bucket{method="GET",route="succeed",le="1.048576e+07"} 2
+		request_message_bytes_bucket{method="GET",route="succeed",le="2.62144e+07"} 2
+		request_message_bytes_bucket{method="GET",route="succeed",le="5.24288e+07"} 2
+		request_message_bytes_bucket{method="GET",route="succeed",le="1.048576e+08"} 2
+		request_message_bytes_bucket{method="GET",route="succeed",le="2.62144e+08"} 2
+		request_message_bytes_bucket{method="GET",route="succeed",le="+Inf"} 2
+		request_message_bytes_sum{method="GET",route="succeed"} 0
+		request_message_bytes_count{method="GET",route="succeed"} 2
+
+		# HELP response_message_bytes Size (in bytes) of messages sent in response.
+		# TYPE response_message_bytes histogram
+		response_message_bytes_bucket{method="GET",route="succeed",le="1.048576e+06"} 2
+		response_message_bytes_bucket{method="GET",route="succeed",le="2.62144e+06"} 2
+		response_message_bytes_bucket{method="GET",route="succeed",le="5.24288e+06"} 2
+		response_message_bytes_bucket{method="GET",route="succeed",le="1.048576e+07"} 2
+		response_message_bytes_bucket{method="GET",route="succeed",le="2.62144e+07"} 2
+		response_message_bytes_bucket{method="GET",route="succeed",le="5.24288e+07"} 2
+		response_message_bytes_bucket{method="GET",route="succeed",le="1.048576e+08"} 2
+		response_message_bytes_bucket{method="GET",route="succeed",le="2.62144e+08"} 2
+		response_message_bytes_bucket{method="GET",route="succeed",le="+Inf"} 2
+		response_message_bytes_sum{method="GET",route="succeed"} 4
+		response_message_bytes_count{method="GET",route="succeed"} 2
+
+		# HELP tcp_connections Current number of accepted TCP connections.
+		# TYPE tcp_connections gauge
+		tcp_connections{protocol="http"} 0
+		tcp_connections{protocol="grpc"} 0
+		
+		# HELP tcp_connections_limit The max number of TCP connections that can be accepted (0 means no limit).
+		# TYPE tcp_connections_limit gauge
+		tcp_connections_limit{protocol="grpc"} 0
+		tcp_connections_limit{protocol="http"} 0
+		`),
+		"request_message_bytes",
+		"response_message_bytes",
+		"inflight_requests",
+		"tcp_connections",
+		"tcp_connections_limit",
+		"inflight_requests",
+	))
 }
 
 func TestRunReturnsError(t *testing.T) {
@@ -578,7 +692,7 @@ func TestTLSServer(t *testing.T) {
 
 	require.Equal(t, res.StatusCode, http.StatusOK)
 
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	require.NoError(t, err)
 	expected := []byte("Hello World!")
 	require.Equal(t, expected, body)
