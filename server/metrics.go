@@ -67,6 +67,7 @@ func newServerMetrics(cfg Config) *serverMetrics {
 }
 
 func (s *serverMetrics) mustRegister() {
+	fmt.Printf("========= MUST Registering metrics\n")
 	s.registerer.MustRegister(
 		s.tcpConnections,
 		s.tcpConnectionsLimit,
@@ -91,6 +92,7 @@ func (s *serverMetrics) mustRegisterOrReuseHistogram(c *prometheus.HistogramVec)
 	if err != nil {
 		if alreadyRegistered, ok := err.(prometheus.AlreadyRegisteredError); ok {
 			if existing, ok := alreadyRegistered.ExistingCollector.(*prometheus.HistogramVec); ok {
+				fmt.Printf("========= EXISTING metric reusing: %v\n", c)
 				return existing
 			}
 			panic(fmt.Sprintf("previously existing collector must be a HistogramVec, "+
@@ -98,6 +100,7 @@ func (s *serverMetrics) mustRegisterOrReuseHistogram(c *prometheus.HistogramVec)
 		}
 		panic(fmt.Sprintf("failed to register metrics: %v", err))
 	}
+	fmt.Printf("========= NEW metric registered: %v\n", c)
 	return c
 }
 
@@ -106,6 +109,7 @@ func (s *serverMetrics) mustRegisterOrReuseGauge(c *prometheus.GaugeVec) *promet
 	if err != nil {
 		if alreadyRegistered, ok := err.(prometheus.AlreadyRegisteredError); ok {
 			if existing, ok := alreadyRegistered.ExistingCollector.(*prometheus.GaugeVec); ok {
+				fmt.Printf("========= EXISTING metric reusing: %v\n", c)
 				return existing
 			}
 			panic(fmt.Sprintf("previously existing collector must be a GaugeVec, "+
@@ -113,5 +117,6 @@ func (s *serverMetrics) mustRegisterOrReuseGauge(c *prometheus.GaugeVec) *promet
 		}
 		panic(fmt.Sprintf("failed to register metrics: %v", err))
 	}
+	fmt.Printf("========= NEW metric registered: %v\n", c)
 	return c
 }
